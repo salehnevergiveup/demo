@@ -23,7 +23,7 @@ const server = http.createServer((req, res) => {
     `);
   } else if (req.url === '/about') {
     res.end(`
-      <h1>About Page</h1>
+      <h1>Saleh page</h1>
       <p>This is a simple Node.js server example.</p>
       <a href="/">← Back to Home</a>
     `);

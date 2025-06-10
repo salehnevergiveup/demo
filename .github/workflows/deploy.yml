@@ -87,7 +87,7 @@ jobs:
         
         # Create environment file
         echo "⚙️ Setting up environment..."
-        sudo tee ${{ secrets.APP_DIR }}/.env > /dev/null << ENV_FILE
+        tee ${{ secrets.APP_DIR }}/.env > /dev/null << ENV_FILE
         NODE_ENV=${{ secrets.NODE_ENV }}
         PORT=${{ vars.APP_PORT }}
         ${{ secrets.APP_ENV_VARS }}
@@ -114,7 +114,7 @@ jobs:
         fi
         
         # Create/update systemd service file
-        sudo tee /etc/systemd/system/${{ secrets.SERVICE_NAME }}.service > /dev/null << SERVICE_FILE
+        sudo tee /etc/systemd/system/${{ secrets.SERVICE_NAME }}.service > /dev/null << 'SERVICE_FILE'
         [Unit]
         Description=Node.js App - ${{ secrets.SERVICE_NAME }}
         After=network.target
@@ -165,40 +165,39 @@ jobs:
         
         # Check if nginx config already exists
         if [ -f "/etc/nginx/sites-available/${{ secrets.SERVICE_NAME }}" ]; then
-          echo "🔄 Nginx config exists - checking if update needed..."
+          echo "🔄 Nginx config exists - updating..."
           NGINX_EXISTS=true
         else
           echo "🆕 Creating new Nginx configuration..."
           NGINX_EXISTS=false
         fi
         
+        # Clean up any conflicting configs (prevent duplicate server blocks)
+        sudo rm -f /etc/nginx/sites-enabled/*
+        
         # Create/update nginx configuration
-        sudo tee /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} > /dev/null << NGINX_CONFIG
+        sudo tee /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} > /dev/null << 'NGINX_CONFIG'
         server {
-            server_name ${{ secrets.DOMAIN_NAME }};
+            listen 80;
+            server_name ${{ secrets.DOMAIN_NAME }} localhost;
+
             location / {
-                proxy_pass http://localhost:${{ vars.APP_PORT }};
+                proxy_pass http://127.0.0.1:${{ vars.APP_PORT }};
                 proxy_http_version 1.1;
-                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Upgrade $http_upgrade;
                 proxy_set_header Connection 'upgrade';
-                proxy_set_header Host \$host;
-                proxy_set_header X-Real-IP \$remote_addr;
-                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                proxy_set_header X-Forwarded-Proto \$scheme;
-                proxy_cache_bypass \$http_upgrade;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
                 proxy_read_timeout 86400;
             }
         }
         NGINX_CONFIG
         
-        # Enable site (only if new or not already enabled)
-        if [ ! -L "/etc/nginx/sites-enabled/${{ secrets.SERVICE_NAME }}" ]; then
-          echo "🔗 Enabling Nginx site..."
-          sudo ln -sf /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} /etc/nginx/sites-enabled/
-          
-          # Remove default nginx site (only once)
-          sudo rm -f /etc/nginx/sites-enabled/default
-        fi
+        # Enable the site
+        sudo ln -sf /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} /etc/nginx/sites-enabled/
         
         # Test nginx config
         if sudo nginx -t; then
@@ -232,15 +231,81 @@ jobs:
         
         CERTBOT_SCRIPT
 
+    - name: Verify deployment
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'VERIFY_SCRIPT'
+        
+        echo "✅ Deployment verification..."
+        
+        # Check service status
+        echo "--- Service Status ---"
+        if sudo systemctl is-active ${{ secrets.SERVICE_NAME }} --quiet; then
+          echo "✅ Service is running"
+        else
+          echo "❌ Service is not running"
+          sudo systemctl status ${{ secrets.SERVICE_NAME }} --no-pager
+        fi
+        
+        # Check nginx status
+        echo "--- Nginx Status ---"
+        if sudo systemctl is-active nginx --quiet; then
+          echo "✅ Nginx is running"
+        else
+          echo "❌ Nginx is not running"
+          sudo systemctl status nginx --no-pager
+        fi
+        
+        # Check if app is responding locally
+        echo "--- App Health Check ---"
+        if curl -f http://localhost:${{ vars.APP_PORT }} > /dev/null 2>&1; then
+          echo "✅ App is responding on port ${{ vars.APP_PORT }}"
+        else
+          echo "❌ App is not responding on port ${{ vars.APP_PORT }}"
+        fi
+        
+        # Check if nginx proxy is working
+        echo "--- Nginx Proxy Check ---"
+        if curl -f http://localhost:80 > /dev/null 2>&1; then
+          echo "✅ Nginx proxy is working"
+        else
+          echo "❌ Nginx proxy is not working"
+        fi
+        
+        # Show recent logs if there are issues
+        echo "--- Recent Service Logs ---"
+        sudo journalctl -u ${{ secrets.SERVICE_NAME }} -n 5 --no-pager
+        
+        VERIFY_SCRIPT
+
+    - name: Final health check
+      run: |
+        echo "🏥 Final health check..."
+        sleep 10
+        
+        # Check HTTP (since SSL is manual)
+        if curl -f -s --max-time 10 http://${{ secrets.DOMAIN_NAME }} > /dev/null; then
+          echo "✅ HTTP health check passed"
+          echo "🌐 App is accessible at: http://${{ secrets.DOMAIN_NAME }}"
+        else
+          echo "⚠️ HTTP health check failed - this might be due to DNS not being configured yet"
+          echo "📍 Your app is running locally and can be accessed once DNS is set up"
+        fi
+
     - name: Deployment completed - Manual SSL setup required
       run: |
+        echo ""
         echo "🎉 Deployment completed successfully!"
+        echo "========================================="
         echo ""
-        echo "⚠️  IMPORTANT: Manual SSL Certificate Setup Required"
-        echo "=================================================="
+        echo "✅ Your application is deployed and running"
+        echo "✅ Nginx reverse proxy is configured" 
+        echo "✅ Certbot is installed and ready"
         echo ""
-        echo "The application has been deployed and Certbot is installed."
-        echo "Please complete these manual steps to enable HTTPS:"
+        echo "⚠️  NEXT STEPS: Manual SSL Certificate Setup"
+        echo "=============================================="
+        echo ""
+        echo "To enable HTTPS, complete these steps:"
         echo ""
         echo "1. SSH into your server:"
         echo "   ssh -i your-key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
@@ -254,47 +319,15 @@ jobs:
         echo "4. Test auto-renewal (optional):"
         echo "   sudo certbot renew --dry-run"
         echo ""
-        echo "🌐 Your app is currently available at: http://${{ secrets.DOMAIN_NAME }}"
-        echo "🔒 After SSL setup, it will be available at: https://${{ secrets.DOMAIN_NAME }}"
-
-    - name: Verify deployment
-      run: |
-        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
-        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'VERIFY_SCRIPT'
-        
-        echo "✅ Deployment verification..."
-        
-        # Check service status
-        echo "--- Service Status ---"
-        sudo systemctl is-active ${{ secrets.SERVICE_NAME }} --quiet && echo "✅ Service is running" || echo "❌ Service is not running"
-        
-        # Check nginx status
-        echo "--- Nginx Status ---"
-        sudo systemctl is-active nginx --quiet && echo "✅ Nginx is running" || echo "❌ Nginx is not running"
-        
-        # Check if app is responding
-        echo "--- App Health Check ---"
-        curl -f http://localhost:${{ vars.APP_PORT }} > /dev/null 2>&1 && echo "✅ App is responding" || echo "❌ App is not responding"
-        
-        # Show recent logs
-        echo "--- Recent Service Logs ---"
-        sudo journalctl -u ${{ secrets.SERVICE_NAME }} -n 5 --no-pager
-        
-        VERIFY_SCRIPT
-
-    - name: Basic health check
-      run: |
-        echo "🏥 Basic health check..."
-        sleep 10
-        
-        # Check HTTP only (no HTTPS since SSL not configured yet)
-        if curl -f -s --max-time 10 http://${{ secrets.DOMAIN_NAME }} > /dev/null; then
-          echo "✅ HTTP health check passed"
-          echo "🌐 App is accessible at: http://${{ secrets.DOMAIN_NAME }}"
-        else
-          echo "⚠️ HTTP health check failed - app might still be starting"
-          echo "Check the logs above for any issues"
-        fi
+        echo "🔧 TROUBLESHOOTING:"
+        echo "• Ensure your domain DNS points to this EC2 instance"
+        echo "• Check security group allows ports 80 and 443"
+        echo "• If issues, check logs: sudo journalctl -u ${{ secrets.SERVICE_NAME }}"
+        echo ""
+        echo "🌐 Current access:"
+        echo "• Local: http://localhost:${{ vars.APP_PORT }}"
+        echo "• Nginx: http://${{ secrets.DOMAIN_NAME }}"
+        echo "• After SSL: https://${{ secrets.DOMAIN_NAME }}"
 
     - name: Cleanup
       if: always()
