@@ -17,7 +17,7 @@ const server = http.createServer((req, res) => {
       <p>Time: ${new Date().toLocaleString()}</p>
       <p>Try visiting:</p>
       <ul>
-        <li><a href="/about">/about</a></li>
+        <li><a href="/about">/about Auto Deployment</a></li>
         <li><a href="/api">/api</a></li>
       </ul>
     `);
