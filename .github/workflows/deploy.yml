@@ -1,0 +1,278 @@
+name: Deploy Node.js App to EC2
+
+on:
+  push:
+    branches: [ main ]
+  
+  # Keep manual trigger as backup option
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: 'Deployment Environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+# Prevent concurrent deployments
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+
+    - name: Setup SSH connection
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+    - name: Deploy to EC2
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'DEPLOY_SCRIPT'
+        
+        echo "🚀 Starting deployment..."
+        
+        # Update system packages
+        sudo apt update
+        
+        # Install Node.js if not exists
+        if ! command -v node &> /dev/null; then
+          echo "📦 Installing Node.js..."
+          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+        fi
+        
+        # Install nginx if not exists
+        if ! command -v nginx &> /dev/null; then
+          echo "📦 Installing Nginx..."
+          sudo apt install -y nginx
+          sudo systemctl enable nginx
+        fi
+        
+        # Clone or update repository
+        if [ -d "${{ secrets.APP_DIR }}" ]; then
+          echo "🔄 Updating existing repository..."
+          cd ${{ secrets.APP_DIR }}
+          git fetch origin
+          git reset --hard origin/main
+          git clean -fd
+        else
+          echo "📥 Cloning repository..."
+          git clone https://github.com/${{ github.repository }}.git ${{ secrets.APP_DIR }}
+          cd ${{ secrets.APP_DIR }}
+        fi
+        
+        # Install dependencies
+        echo "📦 Installing dependencies..."
+        npm ci --only=production
+        
+        # Create environment file
+        echo "⚙️ Setting up environment..."
+        sudo tee ${{ secrets.APP_DIR }}/.env > /dev/null << ENV_FILE
+        NODE_ENV=${{ secrets.NODE_ENV }}
+        PORT=${{ vars.APP_PORT }}
+        ${{ secrets.APP_ENV_VARS }}
+        ENV_FILE
+        
+        # Set proper permissions
+        sudo chown -R ${{ secrets.EC2_USER }}:${{ secrets.EC2_USER }} ${{ secrets.APP_DIR }}
+        chmod 600 ${{ secrets.APP_DIR }}/.env
+        
+        DEPLOY_SCRIPT
+
+    - name: Configure systemd service
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'SERVICE_SCRIPT'
+        
+        # Check if service already exists
+        if sudo systemctl list-unit-files | grep -q "${{ secrets.SERVICE_NAME }}.service"; then
+          echo "🔄 Service exists - updating configuration..."
+          SERVICE_EXISTS=true
+        else
+          echo "🆕 Creating new systemd service..."
+          SERVICE_EXISTS=false
+        fi
+        
+        # Create/update systemd service file
+        sudo tee /etc/systemd/system/${{ secrets.SERVICE_NAME }}.service > /dev/null << SERVICE_FILE
+        [Unit]
+        Description=Node.js App - ${{ secrets.SERVICE_NAME }}
+        After=network.target
+        
+        [Service]
+        Type=simple
+        User=${{ secrets.EC2_USER }}
+        WorkingDirectory=${{ secrets.APP_DIR }}
+        ExecStart=/usr/bin/node ${{ secrets.APP_DIR }}/app.js
+        Restart=always
+        RestartSec=10
+        Environment=NODE_ENV=production
+        EnvironmentFile=${{ secrets.APP_DIR }}/.env
+        StandardOutput=syslog
+        StandardError=syslog
+        SyslogIdentifier=${{ secrets.SERVICE_NAME }}
+        
+        [Install]
+        WantedBy=multi-user.target
+        SERVICE_FILE
+        
+        # Reload systemd (always needed when service file changes)
+        sudo systemctl daemon-reload
+        
+        # Enable service (only if new)
+        if [ "$SERVICE_EXISTS" = false ]; then
+          echo "🔧 Enabling new service..."
+          sudo systemctl enable ${{ secrets.SERVICE_NAME }}
+        fi
+        
+        # Stop service if running (for updates)
+        sudo systemctl stop ${{ secrets.SERVICE_NAME }} || true
+        
+        # Start service
+        sudo systemctl start ${{ secrets.SERVICE_NAME }}
+        
+        # Wait for service to start
+        sleep 5
+        
+        echo "✅ Service configuration completed"
+        
+        SERVICE_SCRIPT
+
+    - name: Configure Nginx reverse proxy
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'NGINX_SCRIPT'
+        
+        # Check if nginx config already exists
+        if [ -f "/etc/nginx/sites-available/${{ secrets.SERVICE_NAME }}" ]; then
+          echo "🔄 Nginx config exists - checking if update needed..."
+          NGINX_EXISTS=true
+        else
+          echo "🆕 Creating new Nginx configuration..."
+          NGINX_EXISTS=false
+        fi
+        
+        # Create/update nginx configuration
+        sudo tee /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} > /dev/null << NGINX_CONFIG
+       
+        server {
+            listen 80;
+            server_name ${{ secrets.DOMAIN_NAME }};
+
+            location / {
+                proxy_pass http://localhost:${{ vars.APP_PORT }};
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade; 
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_cache_bypass $http_upgrade;
+                }
+        }
+
+        NGINX_CONFIG
+        
+        # Enable site (only if new or not already enabled)
+        if [ ! -L "/etc/nginx/sites-enabled/${{ secrets.SERVICE_NAME }}" ]; then
+          echo "🔗 Enabling Nginx site..."
+          sudo ln -sf /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} /etc/nginx/sites-enabled/
+          
+          # Remove default nginx site (only once)
+          sudo rm -f /etc/nginx/sites-enabled/default
+        fi
+        
+        # Test nginx config
+        if sudo nginx -t; then
+          echo "✅ Nginx config test passed"
+          sudo systemctl reload nginx
+        else
+          echo "❌ Nginx config test failed"
+          exit 1
+        fi
+        
+        echo "✅ Nginx configuration completed"
+        
+        NGINX_SCRIPT
+
+    - name: Install Certbot
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'CERTBOT_SCRIPT'
+        
+        # Check if certbot is already installed
+        if command -v certbot &> /dev/null; then
+          echo "✅ Certbot is already installed"
+          certbot --version
+        else
+          echo "📦 Installing Certbot..."
+          sudo apt update
+          sudo apt install -y certbot python3-certbot-nginx
+          echo "✅ Certbot installed successfully"
+          certbot --version
+        fi
+        
+        CERTBOT_SCRIPT
+
+    - name: Deployment completed - Manual SSL setup required
+      run: |
+        echo "🎉 Deployment completed successfully!"
+        echo ""
+        echo "⚠️  IMPORTANT: Manual SSL Certificate Setup Required"
+        echo "=================================================="
+        echo ""
+        echo "The application has been deployed and Certbot is installed."
+        echo "Please complete these manual steps to enable HTTPS:"
+        echo ""
+        echo "1. SSH into your server:"
+        echo "   ssh -i your-key.pem ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}"
+        echo ""
+        echo "2. Get SSL certificate:"
+        echo "   sudo certbot --nginx -d ${{ secrets.DOMAIN_NAME }}"
+        echo ""
+        echo "3. Enable auto-renewal:"
+        echo "   sudo systemctl enable certbot.timer"
+        echo ""
+        echo "4. Test auto-renewal (optional):"
+        echo "   sudo certbot renew --dry-run"
+        echo ""
+        echo "🌐 Your app is currently available at: http://${{ secrets.DOMAIN_NAME }}"
+        echo "🔒 After SSL setup, it will be available at: https://${{ secrets.DOMAIN_NAME }}"
+
+    - name: Verify deployment
+      run: |
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+        ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'VERIFY_SCRIPT'
+        
+        echo "✅ Deployment verification..."
+        
+        # Check service status
+        echo "--- Service Status ---"
+        sudo systemctl is-active ${{ secrets.SERVICE_NAME }} --quiet && echo "✅ Service is running" || echo "❌ Service is not running"
+        
+        # Check nginx status
+        echo "--- Nginx Status ---"
+        sudo systemctl is-active nginx --quiet && echo "✅ Nginx is running" || echo "❌ Nginx is not running"
+        
+        # Check if app is responding
+        echo "--- App Health Check ---"
+        curl -f http://localhost:${{ vars.APP_PORT }} > /dev/null 2>&1 && echo "✅ App is responding" || echo "❌ App is not responding"
+        
+        # Show recent logs
+        echo "--- Recent Service Logs ---"
+        sudo journalctl -u ${{ secrets.SERVICE_NAME }} -n 5 --no-pager
+        
+        VERIFY_SCRIPT
+
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -f ~/.ssh/deploy_key
