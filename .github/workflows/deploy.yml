@@ -40,7 +40,7 @@ jobs:
         ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'DEPLOY_SCRIPT'
         
         echo "🚀 Starting deployment..."
-        
+
         
         # Update system packages
         sudo apt update
@@ -173,11 +173,11 @@ jobs:
             location / {
                 proxy_pass http://localhost:${{ vars.APP_PORT }};
                 proxy_http_version 1.1;
-                proxy_set_header Upgrade $http_upgrade; 
+                proxy_set_header Upgrade $http_upgrade;
                 proxy_set_header Connection 'upgrade';
                 proxy_set_header Host $host;
                 proxy_cache_bypass $http_upgrade;
-                }
+            }
         }
 
         NGINX_CONFIG
