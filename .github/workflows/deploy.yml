@@ -1,6 +1,7 @@
 name: Deploy Node.js App to EC2
 
 on:
+  # Trigger on PR merge to main branch
   push:
     branches: [ main ]
   
@@ -26,6 +27,15 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    - name: Log deployment trigger
+      run: |
+        if [ "${{ github.event_name }}" = "push" ]; then
+          echo "🔄 Auto-deployment triggered by PR merge to main"
+          echo "Commit: ${{ github.sha }}"
+          echo "Author: ${{ github.actor }}"
+        else
+          echo "🚀 Manual deployment triggered"
+        fi
 
     - name: Setup SSH connection
       run: |
@@ -40,7 +50,6 @@ jobs:
         ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'DEPLOY_SCRIPT'
         
         echo "🚀 Starting deployment..."
-
         
         # Update system packages
         sudo apt update
@@ -114,7 +123,7 @@ jobs:
         Type=simple
         User=${{ secrets.EC2_USER }}
         WorkingDirectory=${{ secrets.APP_DIR }}
-        ExecStart=/usr/bin/node ${{ secrets.APP_DIR }}/app.js
+        ExecStart=/usr/bin/node ${{ secrets.APP_DIR }}/server.js
         Restart=always
         RestartSec=10
         Environment=NODE_ENV=production
@@ -165,21 +174,21 @@ jobs:
         
         # Create/update nginx configuration
         sudo tee /etc/nginx/sites-available/${{ secrets.SERVICE_NAME }} > /dev/null << NGINX_CONFIG
-       
         server {
-            listen 80;
             server_name ${{ secrets.DOMAIN_NAME }};
-
             location / {
                 proxy_pass http://localhost:${{ vars.APP_PORT }};
                 proxy_http_version 1.1;
-                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Upgrade \$http_upgrade;
                 proxy_set_header Connection 'upgrade';
-                proxy_set_header Host $host;
-                proxy_cache_bypass $http_upgrade;
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
+                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto \$scheme;
+                proxy_cache_bypass \$http_upgrade;
+                proxy_read_timeout 86400;
             }
         }
-
         NGINX_CONFIG
         
         # Enable site (only if new or not already enabled)
@@ -272,6 +281,20 @@ jobs:
         sudo journalctl -u ${{ secrets.SERVICE_NAME }} -n 5 --no-pager
         
         VERIFY_SCRIPT
+
+    - name: Basic health check
+      run: |
+        echo "🏥 Basic health check..."
+        sleep 10
+        
+        # Check HTTP only (no HTTPS since SSL not configured yet)
+        if curl -f -s --max-time 10 http://${{ secrets.DOMAIN_NAME }} > /dev/null; then
+          echo "✅ HTTP health check passed"
+          echo "🌐 App is accessible at: http://${{ secrets.DOMAIN_NAME }}"
+        else
+          echo "⚠️ HTTP health check failed - app might still be starting"
+          echo "Check the logs above for any issues"
+        fi
 
     - name: Cleanup
       if: always()
